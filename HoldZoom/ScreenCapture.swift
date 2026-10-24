@@ -37,6 +37,7 @@ enum ScreenCapture {
         config.width = Int(CGFloat(display.width) * scale)
         config.height = Int(CGFloat(display.height) * scale)
         config.captureResolution = .best
+        config.showsCursor = false
 
         let image = try await SCScreenshotManager.captureImage(
             contentFilter: filter,

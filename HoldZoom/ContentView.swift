@@ -15,9 +15,10 @@ struct ContentView: View {
         VStack {
             Button("测试全屏覆盖") {
                 Task {
+                    errorMessage = nil
                     do {
                         let image = try await ScreenCapture.capture()
-                        overlay.show(image: image)
+                        try overlay.show(image: image)
                     } catch {
                         errorMessage = error.localizedDescription
                     }
