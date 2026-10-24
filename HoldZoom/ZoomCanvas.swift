@@ -9,10 +9,9 @@ import AppKit
 
 final class ZoomCanvas: NSView {
     private let image: NSImage
-    private var zoom: CGFloat = 1
+    private let settings: HoldZoomSettings
+    private var zoom: CGFloat
     private var imageOrigin: NSPoint = .zero
-    private var flashlightEnabled = false
-    private var flashlightCenter: NSPoint?
     private var dragLocation: NSPoint?
     private var pressedKeyboardDirections: [UInt16: NSPoint] = [:]
     private var keyboardPanTimer: Timer?
@@ -20,18 +19,15 @@ final class ZoomCanvas: NSView {
     private var keyboardPanLastUpdate: TimeInterval?
     private var keyboardPanVelocity: NSPoint = .zero
 
-    private let flashlightRadius: CGFloat = 100
-    private let keyboardPanInitialSpeed: CGFloat = 180
-    private let keyboardPanMaximumSpeed: CGFloat = 2200
-    private let keyboardPanAccelerationDuration: TimeInterval = 0.3
-
-    init(frame: NSRect, image: NSImage, flashlightEnabled: Bool = false) {
+    init(
+        frame: NSRect,
+        image: NSImage,
+        settings: HoldZoomSettings
+    ) {
         self.image = image
-        self.flashlightEnabled = flashlightEnabled
+        self.settings = settings
+        zoom = settings.zoom.minimum
         super.init(frame: frame)
-        if flashlightEnabled {
-            NSCursor.hide()
-        }
     }
 
     required init?(coder _: NSCoder) {
@@ -43,10 +39,10 @@ final class ZoomCanvas: NSView {
     }
 
     override func draw(_: NSRect) {
+        guard let context = NSGraphicsContext.current else { return }
         NSColor.black.setFill()
         NSBezierPath(rect: bounds).fill()
 
-        guard let context = NSGraphicsContext.current else { return }
         let previousInterpolation = context.imageInterpolation
         context.imageInterpolation = .none
         defer { context.imageInterpolation = previousInterpolation }
@@ -64,41 +60,17 @@ final class ZoomCanvas: NSView {
             operation: .sourceOver,
             fraction: 1
         )
-
-        guard flashlightEnabled else { return }
-
-        let center = flashlightCenter ?? NSPoint(x: bounds.midX, y: bounds.midY)
-        let flashlightPath = NSBezierPath(rect: bounds)
-        flashlightPath.appendOval(
-            in: NSRect(
-                x: center.x - flashlightRadius,
-                y: center.y - flashlightRadius,
-                width: flashlightRadius * 2,
-                height: flashlightRadius * 2
-            )
-        )
-        flashlightPath.windingRule = .evenOdd
-        NSColor.black.withAlphaComponent(0.82).setFill()
-        flashlightPath.fill()
     }
 
     override func scrollWheel(with event: NSEvent) {
         let mouse = convert(event.locationInWindow, from: nil)
-        flashlightCenter = mouse
-        if flashlightEnabled {
-            needsDisplay = true
-        }
         handleScroll(
             deltaX: event.scrollingDeltaX,
             deltaY: event.scrollingDeltaY,
             isPrecise: event.hasPreciseScrollingDeltas,
-            controlPressed: event.modifierFlags.contains(.control) && !flashlightEnabled,
+            controlPressed: event.modifierFlags.contains(settings.shortcuts.zoom.eventFlag),
             at: mouse
         )
-    }
-
-    override func mouseMoved(with event: NSEvent) {
-        updateFlashlightCenter(with: event)
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -126,7 +98,7 @@ final class ZoomCanvas: NSView {
     }
 
     override func keyDown(with event: NSEvent) {
-        guard let direction = keyboardDirection(for: event.keyCode) else {
+        guard let direction = settings.shortcuts.panDirection(for: event) else {
             super.keyDown(with: event)
             return
         }
@@ -139,7 +111,7 @@ final class ZoomCanvas: NSView {
     }
 
     override func keyUp(with event: NSEvent) {
-        guard keyboardDirection(for: event.keyCode) != nil else {
+        guard settings.shortcuts.panDirection(for: event) != nil else {
             super.keyUp(with: event)
             return
         }
@@ -150,33 +122,8 @@ final class ZoomCanvas: NSView {
         }
     }
 
-    private func updateFlashlightCenter(with event: NSEvent) {
-        flashlightCenter = convert(event.locationInWindow, from: nil)
-        if flashlightEnabled {
-            needsDisplay = true
-        }
-    }
-
-    private func setFlashlightEnabled(_ enabled: Bool) {
-        guard flashlightEnabled != enabled else { return }
-        flashlightEnabled = enabled
-
-        if enabled {
-            NSCursor.hide()
-        } else {
-            NSCursor.unhide()
-        }
-    }
-
-    func toggleFlashlight() {
-        setFlashlightEnabled(!flashlightEnabled)
-        flashlightCenter = window.map { convert($0.mouseLocationOutsideOfEventStream, from: nil) }
-        needsDisplay = true
-    }
-
     override func viewWillMove(toWindow newWindow: NSWindow?) {
         if newWindow == nil {
-            setFlashlightEnabled(false)
             keyboardPanTimer?.invalidate()
             keyboardPanTimer = nil
             pressedKeyboardDirections.removeAll()
@@ -186,12 +133,10 @@ final class ZoomCanvas: NSView {
     }
 
     private func beginDragging(with event: NSEvent) {
-        updateFlashlightCenter(with: event)
         dragLocation = convert(event.locationInWindow, from: nil)
     }
 
     private func continueDragging(with event: NSEvent) {
-        updateFlashlightCenter(with: event)
         guard let previousLocation = dragLocation else { return }
 
         let location = convert(event.locationInWindow, from: nil)
@@ -230,9 +175,14 @@ final class ZoomCanvas: NSView {
             return
         }
 
-        let sensitivity = isPrecise ? 0.015 : 0.20
+        let sensitivity = isPrecise
+            ? settings.zoom.preciseScrollSensitivity
+            : settings.zoom.scrollSensitivity
         let factor = CGFloat(exp(Double(deltaY) * sensitivity))
-        let newZoom = min(max(zoom * factor, 1), 8)
+        let newZoom = min(
+            max(zoom * factor, settings.zoom.minimum),
+            settings.zoom.maximum
+        )
         guard newZoom != zoom else { return }
 
         let imageX = (mouse.x - imageOrigin.x) / zoom
@@ -279,7 +229,7 @@ private extension ZoomCanvas {
         guard keyboardPanTimer == nil else { return }
         keyboardPanLastUpdate = ProcessInfo.processInfo.systemUptime
 
-        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: settings.keyboardPan.frameInterval, repeats: true) { [weak self] _ in
             self?.updateKeyboardPan()
         }
         keyboardPanTimer = timer
@@ -289,7 +239,7 @@ private extension ZoomCanvas {
     func updateKeyboardPan() {
         let now = ProcessInfo.processInfo.systemUptime
         let previousUpdate = keyboardPanLastUpdate ?? now
-        let deltaTime = min(now - previousUpdate, 0.05)
+        let deltaTime = min(now - previousUpdate, settings.keyboardPan.maximumFrameDelta)
         keyboardPanLastUpdate = now
 
         let direction = pressedKeyboardDirections.values.reduce(.zero) { result, value in
@@ -302,7 +252,9 @@ private extension ZoomCanvas {
             directionLength: directionLength,
             now: now
         )
-        let response = hasDirection ? 24.0 : 10.0
+        let response = hasDirection
+            ? settings.keyboardPan.accelerationResponse
+            : settings.keyboardPan.decelerationResponse
         let blend = 1 - exp(-response * deltaTime)
         keyboardPanVelocity.x += (targetVelocity.x - keyboardPanVelocity.x) * blend
         keyboardPanVelocity.y += (targetVelocity.y - keyboardPanVelocity.y) * blend
@@ -316,7 +268,9 @@ private extension ZoomCanvas {
             )
         }
 
-        if !hasDirection, hypot(keyboardPanVelocity.x, keyboardPanVelocity.y) < 5 {
+        let shouldStop = !hasDirection
+            && hypot(keyboardPanVelocity.x, keyboardPanVelocity.y) < settings.keyboardPan.stopSpeed
+        if shouldStop {
             keyboardPanTimer?.invalidate()
             keyboardPanTimer = nil
             keyboardPanLastUpdate = nil
@@ -334,10 +288,10 @@ private extension ZoomCanvas {
         else { return .zero }
 
         let elapsed = now - keyboardPanStartedAt
-        let progress = min(elapsed / keyboardPanAccelerationDuration, 1)
+        let progress = min(elapsed / settings.keyboardPan.accelerationDuration, 1)
         let easedProgress = CGFloat(progress * progress)
-        let speed = keyboardPanInitialSpeed
-            + (keyboardPanMaximumSpeed - keyboardPanInitialSpeed) * easedProgress
+        let speed = settings.keyboardPan.initialSpeed
+            + (settings.keyboardPan.maximumSpeed - settings.keyboardPan.initialSpeed) * easedProgress
 
         return NSPoint(
             x: direction.x / directionLength * speed,

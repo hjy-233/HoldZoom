@@ -30,6 +30,7 @@ private enum OverlayError: LocalizedError {
 
 @MainActor
 final class ZoomOverlayController {
+    private let settings = HoldZoomSettings.load()
     private var window: NSWindow?
     private var previousApplication: NSRunningApplication?
     private var escapeMonitor: Any?
@@ -38,38 +39,60 @@ final class ZoomOverlayController {
     private var globalKeyboardMonitor: Any?
     private var globalControlMonitor: Any?
     private var controlCaptureTask: Task<Void, Never>?
-    private var flashlightCaptureTask: Task<Void, Never>?
     private var isControlPressed = false
     private var isHeldOverlay = false
-    private var isCommandRFlashlightOverlay = false
+    private var isShortcutFlashlightOverlay = false
 
     init() {
         requestAccessibilityPermission()
-        installCommandRMonitors()
+        installShortcutMonitors()
         installControlMonitors()
     }
 
     func show(image: NSImage) throws {
-        flashlightCaptureTask?.cancel()
-        flashlightCaptureTask = nil
-        isCommandRFlashlightOverlay = false
+        isShortcutFlashlightOverlay = false
         closeOverlay()
         isHeldOverlay = false
         try display(image: image)
     }
 
     private func showWhileControlIsHeld(image: NSImage) throws {
-        isCommandRFlashlightOverlay = false
+        isShortcutFlashlightOverlay = false
         closeOverlay()
         isHeldOverlay = true
         try display(image: image)
     }
 
-    private func display(image: NSImage, flashlightEnabled: Bool = false) throws {
+    private func display(image: NSImage) throws {
         guard let screen = NSScreen.main else {
             throw OverlayError.noScreen
         }
 
+        let canvas = ZoomCanvas(
+            frame: NSRect(origin: .zero, size: screen.frame.size),
+            image: image,
+            settings: settings
+        )
+        try display(canvas, on: screen, ignoresMouseEvents: false)
+    }
+
+    private func displayFlashlight() throws {
+        guard let screen = NSScreen.main else {
+            throw OverlayError.noScreen
+        }
+
+        let canvas = FlashlightCanvas(
+            frame: NSRect(origin: .zero, size: screen.frame.size),
+            settings: settings
+        )
+        try display(canvas, on: screen, ignoresMouseEvents: true)
+    }
+
+    private func display(
+        _ contentView: NSView,
+        on screen: NSScreen,
+        ignoresMouseEvents: Bool
+    ) throws {
         previousApplication = NSWorkspace.shared.frontmostApplication
 
         let window = ZoomOverlayWindow(
@@ -86,37 +109,36 @@ final class ZoomOverlayController {
             .fullScreenAuxiliary
         ]
 
-        window.backgroundColor = .black
-        window.isOpaque = true
+        window.backgroundColor = ignoresMouseEvents ? .clear : .black
+        window.isOpaque = !ignoresMouseEvents
         window.hasShadow = false
-        window.ignoresMouseEvents = false
+        window.ignoresMouseEvents = ignoresMouseEvents
         window.acceptsMouseMovedEvents = true
-
-        let canvas = ZoomCanvas(
-            frame: NSRect(origin: .zero, size: screen.frame.size),
-            image: image,
-            flashlightEnabled: flashlightEnabled
-        )
-        window.contentView = canvas
+        window.contentView = contentView
 
         self.window = window
-        NSApp.activate(ignoringOtherApps: true)
-        window.makeKeyAndOrderFront(nil)
-        guard window.makeFirstResponder(canvas) else {
-            closeOverlay()
-            throw OverlayError.firstResponderUnavailable
-        }
 
-        installEscapeMonitor()
+        if ignoresMouseEvents {
+            window.orderFrontRegardless()
+        } else {
+            NSApp.activate(ignoringOtherApps: true)
+            window.makeKeyAndOrderFront(nil)
+            guard window.makeFirstResponder(contentView) else {
+                closeOverlay()
+                throw OverlayError.firstResponderUnavailable
+            }
+            installEscapeMonitor()
+        }
     }
 
     private func installEscapeMonitor() {
+        let shortcut = settings.shortcuts.exitOverlay
         escapeMonitor = NSEvent.addLocalMonitorForEvents(
             matching: .keyDown
         ) { [weak self] event in
-            if event.keyCode == 53 {
+            if shortcut.matches(event) {
                 DispatchQueue.main.async { [weak self] in
-                    self?.close()
+                    self?.dismissOverlay()
                 }
                 return nil
             }
@@ -125,13 +147,14 @@ final class ZoomOverlayController {
         }
     }
 
-    private func installCommandRMonitors() {
+    private func installShortcutMonitors() {
+        let shortcut = settings.shortcuts.flashlight
         localKeyboardMonitor = NSEvent.addLocalMonitorForEvents(
             matching: .keyDown
         ) { [weak self] event in
-            guard Self.isCommandR(event) else { return event }
+            guard shortcut.matches(event) else { return event }
             DispatchQueue.main.async { [weak self] in
-                self?.toggleCommandRFlashlight()
+                self?.toggleShortcutFlashlight()
             }
             return nil
         }
@@ -139,59 +162,57 @@ final class ZoomOverlayController {
         globalKeyboardMonitor = NSEvent.addGlobalMonitorForEvents(
             matching: .keyDown
         ) { [weak self] event in
-            guard Self.isCommandR(event) else { return }
+            guard shortcut.matches(event) else { return }
             DispatchQueue.main.async { [weak self] in
-                self?.toggleCommandRFlashlight()
+                self?.toggleShortcutFlashlight()
             }
         }
     }
 
-    private static func isCommandR(_ event: NSEvent) -> Bool {
-        event.keyCode == 15 && event.modifierFlags.contains(.command)
+    private func toggleShortcutFlashlight() {
+        if isShortcutFlashlightOverlay {
+            isShortcutFlashlightOverlay = false
+            closeFlashlightOverlay()
+            return
+        }
+
+        controlCaptureTask?.cancel()
+        controlCaptureTask = nil
+        isHeldOverlay = false
+        closeOverlay()
+        isShortcutFlashlightOverlay = true
+        do {
+            try displayFlashlight()
+        } catch {
+            isShortcutFlashlightOverlay = false
+            NSLog("HoldZoom failed to show flashlight: %@", error.localizedDescription)
+            NSAlert(error: error).runModal()
+        }
     }
 
-    private func toggleCommandRFlashlight() {
-        if isCommandRFlashlightOverlay {
-            isCommandRFlashlightOverlay = false
-            flashlightCaptureTask?.cancel()
-            flashlightCaptureTask = nil
+    private func closeFlashlightOverlay() {
+        guard let flashlightWindow = window,
+              let canvas = flashlightWindow.contentView as? FlashlightCanvas
+        else {
             closeOverlay()
             return
         }
 
-        if let canvas = window?.contentView as? ZoomCanvas {
-            canvas.toggleFlashlight()
-            return
-        }
-
-        isCommandRFlashlightOverlay = true
-        flashlightCaptureTask = Task { [weak self] in
-            await self?.showFlashlightOverlay()
-        }
-    }
-
-    private func showFlashlightOverlay() async {
-        do {
-            let image = try await ScreenCapture.capture()
-            guard isCommandRFlashlightOverlay,
-                  !Task.isCancelled,
-                  window == nil
+        canvas.dismiss { [weak self, weak flashlightWindow] in
+            guard let self,
+                  let flashlightWindow,
+                  self.window === flashlightWindow
             else { return }
-            try display(image: image, flashlightEnabled: true)
-        } catch {
-            isCommandRFlashlightOverlay = false
-            guard !Task.isCancelled else { return }
-            NSLog("HoldZoom failed to show flashlight: %@", error.localizedDescription)
-            NSAlert(error: error).runModal()
+            self.closeOverlay()
         }
-        flashlightCaptureTask = nil
     }
 
     private func installControlMonitors() {
+        let captureModifier = settings.shortcuts.captureWhileHeld.eventFlag
         localControlMonitor = NSEvent.addLocalMonitorForEvents(
             matching: .flagsChanged
         ) { [weak self] event in
-            let isPressed = event.modifierFlags.contains(.control)
+            let isPressed = event.modifierFlags.contains(captureModifier)
             DispatchQueue.main.async { [weak self] in
                 self?.setControlPressed(isPressed)
             }
@@ -201,7 +222,7 @@ final class ZoomOverlayController {
         globalControlMonitor = NSEvent.addGlobalMonitorForEvents(
             matching: .flagsChanged
         ) { [weak self] event in
-            let isPressed = event.modifierFlags.contains(.control)
+            let isPressed = event.modifierFlags.contains(captureModifier)
             DispatchQueue.main.async { [weak self] in
                 self?.setControlPressed(isPressed)
             }
@@ -251,11 +272,19 @@ final class ZoomOverlayController {
     func close() {
         controlCaptureTask?.cancel()
         controlCaptureTask = nil
-        flashlightCaptureTask?.cancel()
-        flashlightCaptureTask = nil
         isHeldOverlay = false
-        isCommandRFlashlightOverlay = false
+        isShortcutFlashlightOverlay = false
         closeOverlay()
+    }
+
+    private func dismissOverlay() {
+        guard isShortcutFlashlightOverlay else {
+            closeOverlay()
+            return
+        }
+
+        isShortcutFlashlightOverlay = false
+        closeFlashlightOverlay()
     }
 
     private func closeOverlay() {
@@ -268,11 +297,15 @@ final class ZoomOverlayController {
 
         window?.close()
         window = nil
-        isCommandRFlashlightOverlay = false
+        isShortcutFlashlightOverlay = false
 
+        let shouldRestorePreviousApplication = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+            == Bundle.main.bundleIdentifier
         if let previousApplication {
             self.previousApplication = nil
-            previousApplication.activate(options: [])
+            if shouldRestorePreviousApplication {
+                previousApplication.activate(options: [])
+            }
         }
     }
 }
