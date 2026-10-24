@@ -14,9 +14,16 @@ final class ZoomCanvas: NSView {
     private var flashlightEnabled = false
     private var flashlightCenter: NSPoint?
     private var dragLocation: NSPoint?
+    private var pressedKeyboardDirections: [UInt16: NSPoint] = [:]
+    private var keyboardPanTimer: Timer?
+    private var keyboardPanStartedAt: TimeInterval?
+    private var keyboardPanLastUpdate: TimeInterval?
+    private var keyboardPanVelocity: NSPoint = .zero
 
     private let flashlightRadius: CGFloat = 100
-    private let keyboardPanDistance: CGFloat = 80
+    private let keyboardPanInitialSpeed: CGFloat = 180
+    private let keyboardPanMaximumSpeed: CGFloat = 2200
+    private let keyboardPanAccelerationDuration: TimeInterval = 0.3
 
     init(frame: NSRect, image: NSImage, flashlightEnabled: Bool = false) {
         self.image = image
@@ -119,22 +126,28 @@ final class ZoomCanvas: NSView {
     }
 
     override func keyDown(with event: NSEvent) {
-        let distance = keyboardPanDistance
-        let movement: NSPoint
-        switch event.keyCode {
-        case 13, 126:
-            movement = NSPoint(x: 0, y: -distance)
-        case 0, 123:
-            movement = NSPoint(x: distance, y: 0)
-        case 1, 125:
-            movement = NSPoint(x: 0, y: distance)
-        case 2, 124:
-            movement = NSPoint(x: -distance, y: 0)
-        default:
+        guard let direction = keyboardDirection(for: event.keyCode) else {
             super.keyDown(with: event)
             return
         }
-        moveImage(by: movement)
+
+        if pressedKeyboardDirections.isEmpty {
+            keyboardPanStartedAt = ProcessInfo.processInfo.systemUptime
+        }
+        pressedKeyboardDirections[event.keyCode] = direction
+        startKeyboardPanTimerIfNeeded()
+    }
+
+    override func keyUp(with event: NSEvent) {
+        guard keyboardDirection(for: event.keyCode) != nil else {
+            super.keyUp(with: event)
+            return
+        }
+
+        pressedKeyboardDirections[event.keyCode] = nil
+        if pressedKeyboardDirections.isEmpty {
+            keyboardPanStartedAt = nil
+        }
     }
 
     private func updateFlashlightCenter(with event: NSEvent) {
@@ -164,6 +177,10 @@ final class ZoomCanvas: NSView {
     override func viewWillMove(toWindow newWindow: NSWindow?) {
         if newWindow == nil {
             setFlashlightEnabled(false)
+            keyboardPanTimer?.invalidate()
+            keyboardPanTimer = nil
+            pressedKeyboardDirections.removeAll()
+            keyboardPanVelocity = .zero
         }
         super.viewWillMove(toWindow: newWindow)
     }
@@ -239,5 +256,92 @@ final class ZoomCanvas: NSView {
 
     private var minimumImageOriginY: CGFloat {
         bounds.height * (1 - zoom)
+    }
+}
+
+private extension ZoomCanvas {
+    func keyboardDirection(for keyCode: UInt16) -> NSPoint? {
+        switch keyCode {
+        case 13, 126:
+            NSPoint(x: 0, y: -1)
+        case 0, 123:
+            NSPoint(x: 1, y: 0)
+        case 1, 125:
+            NSPoint(x: 0, y: 1)
+        case 2, 124:
+            NSPoint(x: -1, y: 0)
+        default:
+            nil
+        }
+    }
+
+    func startKeyboardPanTimerIfNeeded() {
+        guard keyboardPanTimer == nil else { return }
+        keyboardPanLastUpdate = ProcessInfo.processInfo.systemUptime
+
+        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            self?.updateKeyboardPan()
+        }
+        keyboardPanTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    func updateKeyboardPan() {
+        let now = ProcessInfo.processInfo.systemUptime
+        let previousUpdate = keyboardPanLastUpdate ?? now
+        let deltaTime = min(now - previousUpdate, 0.05)
+        keyboardPanLastUpdate = now
+
+        let direction = pressedKeyboardDirections.values.reduce(.zero) { result, value in
+            NSPoint(x: result.x + value.x, y: result.y + value.y)
+        }
+        let directionLength = hypot(direction.x, direction.y)
+        let hasDirection = directionLength > 0
+        let targetVelocity = keyboardPanTargetVelocity(
+            direction: direction,
+            directionLength: directionLength,
+            now: now
+        )
+        let response = hasDirection ? 24.0 : 10.0
+        let blend = 1 - exp(-response * deltaTime)
+        keyboardPanVelocity.x += (targetVelocity.x - keyboardPanVelocity.x) * blend
+        keyboardPanVelocity.y += (targetVelocity.y - keyboardPanVelocity.y) * blend
+
+        if deltaTime > 0 {
+            moveImage(
+                by: NSPoint(
+                    x: keyboardPanVelocity.x * deltaTime,
+                    y: keyboardPanVelocity.y * deltaTime
+                )
+            )
+        }
+
+        if !hasDirection, hypot(keyboardPanVelocity.x, keyboardPanVelocity.y) < 5 {
+            keyboardPanTimer?.invalidate()
+            keyboardPanTimer = nil
+            keyboardPanLastUpdate = nil
+            keyboardPanVelocity = .zero
+        }
+    }
+
+    func keyboardPanTargetVelocity(
+        direction: NSPoint,
+        directionLength: CGFloat,
+        now: TimeInterval
+    ) -> NSPoint {
+        guard directionLength > 0,
+              let keyboardPanStartedAt
+        else { return .zero }
+
+        let elapsed = now - keyboardPanStartedAt
+        let progress = min(elapsed / keyboardPanAccelerationDuration, 1)
+        let easedProgress = CGFloat(progress * progress)
+        let speed = keyboardPanInitialSpeed
+            + (keyboardPanMaximumSpeed - keyboardPanInitialSpeed) * easedProgress
+
+        return NSPoint(
+            x: direction.x / directionLength * speed,
+            y: direction.y / directionLength * speed
+        )
     }
 }
