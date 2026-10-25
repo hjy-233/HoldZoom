@@ -19,6 +19,7 @@ struct HoldZoomSettings: Codable {
             flashlight: KeyBinding(key: "r", modifiers: [.command]),
             zoom: .control,
             captureWhileHeld: .control,
+            captureDelay: 0.25,
             exitOverlay: KeyBinding(key: "escape", modifiers: []),
             panUp: ["w", "up"],
             panLeft: ["a", "left"],
@@ -49,6 +50,7 @@ struct HoldZoomSettings: Codable {
         var flashlight: KeyBinding
         var zoom: ModifierKey
         var captureWhileHeld: ModifierKey
+        var captureDelay: TimeInterval?
         var exitOverlay: KeyBinding
         var panUp: [String]
         var panLeft: [String]
@@ -58,8 +60,10 @@ struct HoldZoomSettings: Codable {
 
         func panDirection(for event: NSEvent) -> NSPoint? {
             let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-            let actualModifiers = ModifierKey.allCases.filter { flags.contains($0.eventFlag) }
-            guard Set(actualModifiers) == Set(panModifiers) else { return nil }
+            let actualModifiers = Set(ModifierKey.allCases.filter { flags.contains($0.eventFlag) })
+                .subtracting(Set([captureWhileHeld]))
+            let expectedModifiers = Set(panModifiers).subtracting(Set([captureWhileHeld]))
+            guard actualModifiers == expectedModifiers else { return nil }
 
             if panUp.contains(where: { KeyBinding.keyCode(for: $0) == event.keyCode }) {
                 return NSPoint(x: 0, y: -1)
@@ -115,6 +119,15 @@ struct HoldZoomSettings: Codable {
             case .control: .control
             case .option: .option
             case .shift: .shift
+            }
+        }
+
+        var eventSourceFlag: CGEventFlags {
+            switch self {
+            case .command: .maskCommand
+            case .control: .maskControl
+            case .option: .maskAlternate
+            case .shift: .maskShift
             }
         }
     }
@@ -173,6 +186,7 @@ struct HoldZoomSettings: Codable {
             && keyboardPan.stopSpeed >= 0
         let validShortcuts = KeyBinding.keyCode(for: shortcuts.flashlight.key) != nil
             && KeyBinding.keyCode(for: shortcuts.exitOverlay.key) != nil
+            && (shortcuts.captureDelay.map { $0.isFinite && (0 ... 2).contains($0) } ?? true)
             && [shortcuts.panUp, shortcuts.panLeft, shortcuts.panDown, shortcuts.panRight]
             .allSatisfy { !$0.isEmpty && $0.allSatisfy { KeyBinding.keyCode(for: $0) != nil } }
 

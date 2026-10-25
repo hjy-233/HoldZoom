@@ -64,29 +64,30 @@ final class ZoomCanvas: NSView {
 
     override func scrollWheel(with event: NSEvent) {
         let mouse = convert(event.locationInWindow, from: nil)
+        let controlPressed = event.modifierFlags.contains(settings.shortcuts.zoom.eventFlag)
         handleScroll(
             deltaX: event.scrollingDeltaX,
             deltaY: event.scrollingDeltaY,
             isPrecise: event.hasPreciseScrollingDeltas,
-            controlPressed: event.modifierFlags.contains(settings.shortcuts.zoom.eventFlag),
+            controlPressed: controlPressed,
             at: mouse
         )
     }
 
     override func mouseDown(with event: NSEvent) {
-        beginDragging(with: event)
+        beginDragging(at: convert(event.locationInWindow, from: nil))
     }
 
     override func rightMouseDown(with event: NSEvent) {
-        beginDragging(with: event)
+        beginDragging(at: convert(event.locationInWindow, from: nil))
     }
 
     override func mouseDragged(with event: NSEvent) {
-        continueDragging(with: event)
+        continueDragging(at: convert(event.locationInWindow, from: nil))
     }
 
     override func rightMouseDragged(with event: NSEvent) {
-        continueDragging(with: event)
+        continueDragging(at: convert(event.locationInWindow, from: nil))
     }
 
     override func mouseUp(with _: NSEvent) {
@@ -132,14 +133,13 @@ final class ZoomCanvas: NSView {
         super.viewWillMove(toWindow: newWindow)
     }
 
-    private func beginDragging(with event: NSEvent) {
-        dragLocation = convert(event.locationInWindow, from: nil)
+    func beginDragging(at location: NSPoint) {
+        dragLocation = location
     }
 
-    private func continueDragging(with event: NSEvent) {
+    func continueDragging(at location: NSPoint) {
         guard let previousLocation = dragLocation else { return }
 
-        let location = convert(event.locationInWindow, from: nil)
         moveImage(
             by: NSPoint(
                 x: location.x - previousLocation.x,
@@ -149,7 +149,7 @@ final class ZoomCanvas: NSView {
         dragLocation = location
     }
 
-    private func endDragging() {
+    func endDragging() {
         dragLocation = nil
     }
 
@@ -160,7 +160,7 @@ final class ZoomCanvas: NSView {
         needsDisplay = true
     }
 
-    private func handleScroll(
+    func handleScroll(
         deltaX: CGFloat,
         deltaY: CGFloat,
         isPrecise: Bool,

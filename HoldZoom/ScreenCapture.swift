@@ -8,13 +8,27 @@
 import AppKit
 import ScreenCaptureKit
 
-enum CaptureError: Error {
+enum CaptureError: LocalizedError {
     case noDisplay
+    case screenRecordingPermission
+
+    var errorDescription: String? {
+        switch self {
+        case .noDisplay:
+            String(localized: "无法找到屏幕")
+        case .screenRecordingPermission:
+            String(localized: "请在系统设置的“隐私与安全性”中允许 HoldZoom 录制屏幕，然后重新打开 HoldZoom")
+        }
+    }
 }
 
 @MainActor
 enum ScreenCapture {
     static func capture() async throws -> NSImage {
+        if !CGPreflightScreenCaptureAccess(), !CGRequestScreenCaptureAccess() {
+            throw CaptureError.screenRecordingPermission
+        }
+
         let content = try await SCShareableContent
             .excludingDesktopWindows(
                 false,
