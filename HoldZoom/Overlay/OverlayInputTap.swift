@@ -1,6 +1,7 @@
 //
 //  OverlayInputTap.swift
 //  HoldZoom
+//  Created by hjy_666 on 2026/10/25.
 //
 
 import AppKit
@@ -11,10 +12,15 @@ final class OverlayInputTap {
     private let panModifiers: Set<HoldZoomSettings.ModifierKey>
     private let exitKeyCode: UInt16?
     private let exitModifiers: Set<HoldZoomSettings.ModifierKey>
+    private let annotationShortcuts: [HoldZoomSettings.KeyBinding]
+    private let annotationEnterKeyCode: UInt16?
     private let captureModifier: HoldZoomSettings.ModifierKey
     private let overlayWindowNumber: Int
     private let handler: (NSEvent, NSPoint) -> Void
     private var capturedMouseButtons = Set<CGEventType>()
+    private var capturedKeyboardKeys = Set<UInt16>()
+    var annotationMode = false
+    var annotationToolDetailsIsShown = false
     fileprivate var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
 
@@ -22,6 +28,8 @@ final class OverlayInputTap {
         panKeyCodes: Set<UInt16>,
         panModifiers: Set<HoldZoomSettings.ModifierKey>,
         exitShortcut: HoldZoomSettings.KeyBinding,
+        annotationEnterShortcut: HoldZoomSettings.KeyBinding,
+        annotationShortcuts: [HoldZoomSettings.KeyBinding],
         captureModifier: HoldZoomSettings.ModifierKey,
         overlayWindowNumber: Int,
         handler: @escaping (NSEvent, NSPoint) -> Void
@@ -30,6 +38,8 @@ final class OverlayInputTap {
         self.panModifiers = panModifiers
         exitKeyCode = HoldZoomSettings.KeyBinding.keyCode(for: exitShortcut.key)
         exitModifiers = Set(exitShortcut.modifiers)
+        annotationEnterKeyCode = HoldZoomSettings.KeyBinding.keyCode(for: annotationEnterShortcut.key)
+        self.annotationShortcuts = annotationShortcuts
         self.captureModifier = captureModifier
         self.overlayWindowNumber = overlayWindowNumber
         self.handler = handler
@@ -85,15 +95,16 @@ final class OverlayInputTap {
         _ event: CGEvent,
         type: CGEventType
     ) -> Bool {
-        if type == .scrollWheel {
-            return true
+        if shouldPassMouseEvent(type) {
+            releaseCapturedMouseButton(for: type)
+            return false
         }
-        let windowUnderPointer = Int(
-            event.getIntegerValueField(.mouseEventWindowUnderMousePointerThatCanHandleThisEvent)
-        )
+        if type == .scrollWheel {
+            return pointerIsOverOverlay(event)
+        }
         switch type {
         case .leftMouseDown, .rightMouseDown:
-            guard windowUnderPointer == overlayWindowNumber else { return false }
+            guard pointerIsOverOverlay(event) else { return false }
             capturedMouseButtons.insert(type == .leftMouseDown ? .leftMouseDragged : .rightMouseDragged)
             return true
         case .leftMouseDragged, .rightMouseDragged:
@@ -107,14 +118,82 @@ final class OverlayInputTap {
         guard type == .keyDown || type == .keyUp else { return false }
 
         let keyCode = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
+        if type == .keyUp {
+            return capturedKeyboardKeys.remove(keyCode) != nil
+        }
         let actualModifiers = Set(
             HoldZoomSettings.ModifierKey.allCases.filter { event.flags.contains($0.eventSourceFlag) }
         ).subtracting([captureModifier])
         let expectedPanModifiers = panModifiers.subtracting([captureModifier])
         let expectedExitModifiers = exitModifiers.subtracting([captureModifier])
-        let isPanKey = panKeyCodes.contains(keyCode) && actualModifiers == expectedPanModifiers
+        let isPanKey = !annotationToolDetailsIsShown
+            && panKeyCodes.contains(keyCode)
+            && actualModifiers == expectedPanModifiers
         let isExitKey = keyCode == exitKeyCode && actualModifiers == expectedExitModifiers
-        return isPanKey || isExitKey
+        let isAnnotationActionShortcut = annotationMode
+            && keyCode != annotationEnterKeyCode
+            && matchesAnnotationShortcut(keyCode, modifiers: actualModifiers)
+        let isAnnotationEntryShortcut = !annotationMode
+            && keyCode == annotationEnterKeyCode
+            && event.flags.contains(captureModifier.eventSourceFlag)
+            && matchesAnnotationShortcut(keyCode, modifiers: actualModifiers)
+        let shouldHandle = isPanKey || isExitKey || isAnnotationActionShortcut || isAnnotationEntryShortcut
+        if shouldHandle {
+            capturedKeyboardKeys.insert(keyCode)
+        }
+        return shouldHandle
+    }
+
+    private func isRightMouseEvent(_ type: CGEventType) -> Bool {
+        switch type {
+        case .rightMouseDown, .rightMouseDragged, .rightMouseUp:
+            true
+        default:
+            false
+        }
+    }
+
+    private func shouldPassMouseEvent(_ type: CGEventType) -> Bool {
+        (annotationMode && isRightMouseEvent(type))
+            || (annotationToolDetailsIsShown && shouldPassPointerEvent(type))
+    }
+
+    private func pointerIsOverOverlay(_ event: CGEvent) -> Bool {
+        let windowUnderPointer = Int(
+            event.getIntegerValueField(.mouseEventWindowUnderMousePointerThatCanHandleThisEvent)
+        )
+        return windowUnderPointer == overlayWindowNumber
+    }
+
+    private func shouldPassPointerEvent(_ type: CGEventType) -> Bool {
+        switch type {
+        case .scrollWheel, .leftMouseDown, .leftMouseDragged, .leftMouseUp,
+             .rightMouseDown, .rightMouseDragged, .rightMouseUp:
+            true
+        default:
+            false
+        }
+    }
+
+    private func releaseCapturedMouseButton(for type: CGEventType) {
+        switch type {
+        case .leftMouseUp:
+            capturedMouseButtons.remove(.leftMouseDragged)
+        case .rightMouseUp:
+            capturedMouseButtons.remove(.rightMouseDragged)
+        default:
+            break
+        }
+    }
+
+    private func matchesAnnotationShortcut(
+        _ keyCode: UInt16,
+        modifiers: Set<HoldZoomSettings.ModifierKey>
+    ) -> Bool {
+        annotationShortcuts.contains { shortcut in
+            HoldZoomSettings.KeyBinding.keyCode(for: shortcut.key) == keyCode
+                && Set(shortcut.modifiers).subtracting([captureModifier]) == modifiers
+        }
     }
 
     fileprivate func send(_ event: CGEvent, at location: NSPoint) {

@@ -30,20 +30,23 @@ private enum OverlayError: LocalizedError {
 
 @MainActor
 final class ZoomOverlayController {
-    private let settings = HoldZoomSettings.load()
-    private var window: NSWindow?
+    let settings = HoldZoomSettings.load()
+    private let annotationSessionStore = AnnotationSessionStore()
+    var window: NSWindow?
     private var previousApplication: NSRunningApplication?
-    private var overlayInputTap: OverlayInputTap?
-    private var localKeyboardMonitor: Any?
-    private var localControlMonitor: Any?
-    private var globalKeyboardMonitor: Any?
-    private var globalControlMonitor: Any?
-    private var controlCaptureTask: Task<Void, Never>?
+    var overlayInputTap: OverlayInputTap?
+    var annotationToolDetailsPreviousWindowLevel: NSWindow.Level?
+    var localKeyboardMonitor: Any?
+    var localControlMonitor: Any?
+    var globalKeyboardMonitor: Any?
+    var globalControlMonitor: Any?
+    var controlCaptureTask: Task<Void, Never>?
     private var controlStateTimer: Timer?
-    private var isControlPressed = false
-    private var isHeldOverlay = false
+    var isControlPressed = false
+    var isAnnotationCapturePending = false
+    private var isControlShortcutOverlay = false
     private var isShortcutFlashlightOverlay = false
-    private var hasPresentedCaptureError = false
+    var hasPresentedCaptureError = false
 
     init() {
         requestAccessibilityPermission()
@@ -54,16 +57,39 @@ final class ZoomOverlayController {
     }
 
     func show(image: NSImage) throws {
+        isControlShortcutOverlay = false
         isShortcutFlashlightOverlay = false
         closeOverlay()
-        isHeldOverlay = false
         try display(image: image)
     }
 
-    private func showWhileControlIsHeld(image: NSImage) throws {
+    func saveCurrentSession() throws {
+        guard let canvas = window?.contentView as? ZoomCanvas else {
+            throw AnnotationSessionError.noCurrentOverlay
+        }
+        try annotationSessionStore.save(
+            image: canvas.imageForSaving(),
+            strokes: canvas.annotationStrokes
+        )
+    }
+
+    func restoreLatestScreenshot() throws {
+        let session = try annotationSessionStore.loadLatest()
+        try show(image: session.image)
+    }
+
+    func restoreLatestAnnotations() throws {
+        guard let canvas = window?.contentView as? ZoomCanvas else {
+            throw AnnotationSessionError.noCurrentOverlay
+        }
+        let strokes = try annotationSessionStore.latestAnnotations(matching: canvas.imageForSaving())
+        canvas.replaceAnnotations(with: strokes)
+    }
+
+    func showFromControlShortcut(image: NSImage) throws {
         isShortcutFlashlightOverlay = false
         closeOverlay()
-        isHeldOverlay = true
+        isControlShortcutOverlay = true
         try display(image: image)
     }
 
@@ -77,6 +103,13 @@ final class ZoomOverlayController {
             image: image,
             settings: settings
         )
+        canvas.annotationAppearanceDidChange = { appearance in
+            do {
+                try HoldZoomSettings.save(annotationAppearance: appearance)
+            } catch {
+                NSLog("HoldZoom could not save annotation settings: %@", error.localizedDescription)
+            }
+        }
         try display(canvas, on: screen, ignoresMouseEvents: false)
     }
 
@@ -136,29 +169,7 @@ final class ZoomOverlayController {
         }
     }
 
-    private func installShortcutMonitors() {
-        let shortcut = settings.shortcuts.flashlight
-        localKeyboardMonitor = NSEvent.addLocalMonitorForEvents(
-            matching: .keyDown
-        ) { [weak self] event in
-            guard shortcut.matches(event) else { return event }
-            DispatchQueue.main.async { [weak self] in
-                self?.toggleShortcutFlashlight()
-            }
-            return nil
-        }
-
-        globalKeyboardMonitor = NSEvent.addGlobalMonitorForEvents(
-            matching: .keyDown
-        ) { [weak self] event in
-            guard shortcut.matches(event) else { return }
-            DispatchQueue.main.async { [weak self] in
-                self?.toggleShortcutFlashlight()
-            }
-        }
-    }
-
-    private func toggleShortcutFlashlight() {
+    func toggleShortcutFlashlight() {
         if isShortcutFlashlightOverlay {
             isShortcutFlashlightOverlay = false
             closeFlashlightOverlay()
@@ -167,7 +178,7 @@ final class ZoomOverlayController {
 
         controlCaptureTask?.cancel()
         controlCaptureTask = nil
-        isHeldOverlay = false
+        isControlShortcutOverlay = false
         closeOverlay()
         isShortcutFlashlightOverlay = true
         do {
@@ -200,57 +211,27 @@ final class ZoomOverlayController {
         }
     }
 
-    private func installControlMonitors() {
-        let captureModifier = settings.shortcuts.captureWhileHeld.eventFlag
-        localControlMonitor = NSEvent.addLocalMonitorForEvents(
-            matching: .flagsChanged
-        ) { [weak self] event in
-            let isPressed = event.modifierFlags.contains(captureModifier)
-            DispatchQueue.main.async { [weak self] in
-                self?.setControlPressed(isPressed)
-            }
-            return event
-        }
-
-        globalControlMonitor = NSEvent.addGlobalMonitorForEvents(
-            matching: .flagsChanged
-        ) { [weak self] event in
-            let isPressed = event.modifierFlags.contains(captureModifier)
-            DispatchQueue.main.async { [weak self] in
-                self?.setControlPressed(isPressed)
-            }
-        }
-    }
-
-    private func requestAccessibilityPermission() {
-        guard !AXIsProcessTrusted() else { return }
-        let options = [
-            kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true
-        ] as CFDictionary
-        _ = AXIsProcessTrustedWithOptions(options)
-    }
-
-    private func requestScreenCapturePermission() {
-        guard !CGPreflightScreenCaptureAccess() else { return }
-        _ = CGRequestScreenCaptureAccess()
-    }
-
-    private func setControlPressed(_ isPressed: Bool) {
+    func setControlPressed(_ isPressed: Bool) {
         guard isControlPressed != isPressed else { return }
         isControlPressed = isPressed
 
         if isPressed {
             startControlStatePolling()
-            guard window == nil else { return }
+            guard window == nil, !isAnnotationCapturePending else { return }
+            controlCaptureTask?.cancel()
             controlCaptureTask = Task { [weak self] in
-                await self?.showCapturedImageWhileControlIsHeld()
+                await self?.showCapturedImageAfterControlPress()
             }
         } else {
+            guard !isAnnotationCapturePending else { return }
             controlCaptureTask?.cancel()
             controlCaptureTask = nil
-            if isHeldOverlay {
+            guard isControlShortcutOverlay else { return }
+            guard let canvas = window?.contentView as? ZoomCanvas,
+                  canvas.annotationMode || !canvas.annotationStrokes.isEmpty
+            else {
                 closeOverlay()
-                isHeldOverlay = false
+                return
             }
         }
     }
@@ -258,12 +239,13 @@ final class ZoomOverlayController {
     func close() {
         controlCaptureTask?.cancel()
         controlCaptureTask = nil
-        isHeldOverlay = false
+        isAnnotationCapturePending = false
+        isControlShortcutOverlay = false
         isShortcutFlashlightOverlay = false
         closeOverlay()
     }
 
-    private func dismissOverlay() {
+    func dismissOverlay() {
         guard isShortcutFlashlightOverlay else {
             closeOverlay()
             return
@@ -276,6 +258,11 @@ final class ZoomOverlayController {
     private func closeOverlay() {
         overlayInputTap?.invalidate()
         overlayInputTap = nil
+        if let previousLevel = annotationToolDetailsPreviousWindowLevel {
+            window?.level = previousLevel
+            annotationToolDetailsPreviousWindowLevel = nil
+        }
+        isControlShortcutOverlay = false
         guard window != nil else {
             return
         }
@@ -296,6 +283,19 @@ final class ZoomOverlayController {
 }
 
 private extension ZoomOverlayController {
+    func requestAccessibilityPermission() {
+        guard !AXIsProcessTrusted() else { return }
+        let options = [
+            kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true
+        ] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(options)
+    }
+
+    func requestScreenCapturePermission() {
+        guard !CGPreflightScreenCaptureAccess() else { return }
+        _ = CGRequestScreenCaptureAccess()
+    }
+
     func startControlStatePolling() {
         guard controlStateTimer == nil else { return }
         let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
@@ -308,85 +308,5 @@ private extension ZoomOverlayController {
         }
         RunLoop.main.add(timer, forMode: .common)
         controlStateTimer = timer
-    }
-
-    func installInputTap(for canvas: ZoomCanvas) -> Bool {
-        let panKeys = settings.shortcuts.panUp
-            + settings.shortcuts.panLeft
-            + settings.shortcuts.panDown
-            + settings.shortcuts.panRight
-        let keyCodes = Set(panKeys.compactMap(HoldZoomSettings.KeyBinding.keyCode(for:)))
-        guard let overlayWindowNumber = canvas.window?.windowNumber else { return false }
-        let tap = OverlayInputTap(
-            panKeyCodes: keyCodes,
-            panModifiers: Set(settings.shortcuts.panModifiers),
-            exitShortcut: settings.shortcuts.exitOverlay,
-            captureModifier: settings.shortcuts.captureWhileHeld,
-            overlayWindowNumber: overlayWindowNumber
-        ) { [weak self, weak canvas] event, location in
-            guard let self, let canvas else { return }
-            handleOverlayInput(event, at: location, canvas: canvas)
-        }
-        guard tap.install() else { return false }
-        overlayInputTap = tap
-        return true
-    }
-
-    func handleOverlayInput(_ event: NSEvent, at location: NSPoint, canvas: ZoomCanvas) {
-        guard let window = canvas.window else { return }
-        let windowLocation = window.convertPoint(fromScreen: location)
-        let mouse = canvas.convert(windowLocation, from: nil)
-
-        if event.type == .scrollWheel {
-            canvas.handleScroll(
-                deltaX: event.scrollingDeltaX,
-                deltaY: event.scrollingDeltaY,
-                isPrecise: event.hasPreciseScrollingDeltas,
-                controlPressed: event.modifierFlags.contains(settings.shortcuts.zoom.eventFlag),
-                at: mouse
-            )
-            return
-        }
-
-        switch event.type {
-        case .leftMouseDown, .rightMouseDown:
-            canvas.beginDragging(at: mouse)
-        case .leftMouseDragged, .rightMouseDragged:
-            canvas.continueDragging(at: mouse)
-        case .leftMouseUp, .rightMouseUp:
-            canvas.endDragging()
-        case .keyDown where event.keyCode
-            == (HoldZoomSettings.KeyBinding.keyCode(for: settings.shortcuts.exitOverlay.key) ?? .max):
-            dismissOverlay()
-        case .keyDown:
-            canvas.keyDown(with: event)
-        case .keyUp:
-            canvas.keyUp(with: event)
-        default:
-            break
-        }
-    }
-
-    func showCapturedImageWhileControlIsHeld() async {
-        do {
-            let delay = settings.shortcuts.captureDelay ?? 0.25
-            if delay > 0 {
-                try await Task.sleep(for: .seconds(delay))
-            }
-
-            let image = try await ScreenCapture.capture()
-            guard isControlPressed,
-                  !Task.isCancelled,
-                  window == nil
-            else { return }
-            try showWhileControlIsHeld(image: image)
-        } catch is CancellationError {
-            return
-        } catch {
-            NSLog("HoldZoom failed to show captured screen: %@", error.localizedDescription)
-            guard !hasPresentedCaptureError else { return }
-            hasPresentedCaptureError = true
-            NSAlert(error: error).runModal()
-        }
     }
 }

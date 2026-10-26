@@ -7,12 +7,55 @@
 
 import AppKit
 
-final class ZoomCanvas: NSView {
+final class ZoomCanvas: NSView, NSPopoverDelegate {
     private let image: NSImage
     private let settings: HoldZoomSettings
-    private var zoom: CGFloat
-    private var imageOrigin: NSPoint = .zero
+    var annotationMode = false
+    var annotationStrokes: [AnnotationStroke]
+    var selectedAnnotationTool = AnnotationTool.pen
+    var currentAnnotationTool = AnnotationTool.pen
+    var annotationAppearance: AnnotationAppearance
+    var annotationColor: AnnotationColor {
+        get { annotationAppearance.color }
+        set { annotationAppearance.color = newValue }
+    }
+
+    var annotationLineWidth: Double {
+        get { annotationAppearance.lineWidth }
+        set { annotationAppearance.lineWidth = newValue }
+    }
+
+    var annotationFillShapes: Bool {
+        get { annotationAppearance.fillShapes }
+        set { annotationAppearance.fillShapes = newValue }
+    }
+
+    var annotationEraserMode: AnnotationEraserMode {
+        get { annotationAppearance.eraserMode }
+        set { annotationAppearance.eraserMode = newValue }
+    }
+
+    var annotationEraserSize: CGFloat {
+        get { annotationAppearance.eraserSize }
+        set { annotationAppearance.eraserSize = newValue }
+    }
+
+    var annotationAppearanceDidChange: ((AnnotationAppearance) -> Void)?
+    var annotationToolPicker: NSVisualEffectView?
+    var annotationToolDetailsPopover: NSPopover?
+    var annotationToolDetailsTool: AnnotationTool?
+    var annotationToolDetailsStateDidChange: ((Bool) -> Void)?
+    var annotationToolButtons: [AnnotationTool: NSButton] = [:]
+    var annotationUndoButton: NSButton?
+    var annotationRedoButton: NSButton?
+    var isAnnotationToolPickerGesture = false
+    var hasRecordedEraserGesture = false
+    var annotationUndoHistory: [[AnnotationStroke]] = []
+    var annotationRedoHistory: [[AnnotationStroke]] = []
+    var zoom: CGFloat
+    var imageOrigin: NSPoint = .zero
     private var dragLocation: NSPoint?
+    var currentAnnotationPoints: [AnnotationPoint]?
     private var pressedKeyboardDirections: [UInt16: NSPoint] = [:]
     private var keyboardPanTimer: Timer?
     private var keyboardPanStartedAt: TimeInterval?
@@ -22,12 +65,16 @@ final class ZoomCanvas: NSView {
     init(
         frame: NSRect,
         image: NSImage,
-        settings: HoldZoomSettings
+        settings: HoldZoomSettings,
+        annotationStrokes: [AnnotationStroke] = []
     ) {
         self.image = image
         self.settings = settings
+        self.annotationStrokes = annotationStrokes
+        annotationAppearance = settings.annotationAppearance
         zoom = settings.zoom.minimum
         super.init(frame: frame)
+        installAnnotationToolPicker()
     }
 
     required init?(coder _: NSCoder) {
@@ -60,6 +107,10 @@ final class ZoomCanvas: NSView {
             operation: .sourceOver,
             fraction: 1
         )
+        drawAnnotations()
+        if annotationMode {
+            drawAnnotationModeIndicator()
+        }
     }
 
     override func scrollWheel(with event: NSEvent) {
@@ -69,32 +120,64 @@ final class ZoomCanvas: NSView {
             deltaX: event.scrollingDeltaX,
             deltaY: event.scrollingDeltaY,
             isPrecise: event.hasPreciseScrollingDeltas,
-            controlPressed: controlPressed,
+            controlPressed: controlPressed || annotationMode,
             at: mouse
         )
     }
 
     override func mouseDown(with event: NSEvent) {
-        beginDragging(at: convert(event.locationInWindow, from: nil))
+        let location = convert(event.locationInWindow, from: nil)
+        if handleAnnotationToolPicker(event, at: location) {
+            return
+        }
+        if annotationMode {
+            beginAnnotation(at: location)
+        } else {
+            beginDragging(at: location)
+        }
     }
 
     override func rightMouseDown(with event: NSEvent) {
-        beginDragging(at: convert(event.locationInWindow, from: nil))
+        let location = convert(event.locationInWindow, from: nil)
+        if handleAnnotationToolPicker(event, at: location) {
+            return
+        }
+        beginDragging(at: location)
     }
 
     override func mouseDragged(with event: NSEvent) {
-        continueDragging(at: convert(event.locationInWindow, from: nil))
+        let location = convert(event.locationInWindow, from: nil)
+        if handleAnnotationToolPicker(event, at: location) {
+            return
+        }
+        if currentAnnotationPoints != nil {
+            continueAnnotation(at: location)
+        } else {
+            continueDragging(at: location)
+        }
     }
 
     override func rightMouseDragged(with event: NSEvent) {
-        continueDragging(at: convert(event.locationInWindow, from: nil))
+        let location = convert(event.locationInWindow, from: nil)
+        if handleAnnotationToolPicker(event, at: location) {
+            return
+        }
+        continueDragging(at: location)
     }
 
     override func mouseUp(with _: NSEvent) {
+        if isAnnotationToolPickerGesture {
+            isAnnotationToolPickerGesture = false
+            return
+        }
+        endAnnotation()
         endDragging()
     }
 
-    override func rightMouseUp(with _: NSEvent) {
+    override func rightMouseUp(with event: NSEvent) {
+        if handleAnnotationToolPicker(event, at: convert(event.locationInWindow, from: nil)) {
+            return
+        }
         endDragging()
     }
 
@@ -153,6 +236,10 @@ final class ZoomCanvas: NSView {
         dragLocation = nil
     }
 
+    func imageForSaving() -> NSImage {
+        image
+    }
+
     private func moveImage(by distance: NSPoint) {
         imageOrigin.x += distance.x
         imageOrigin.y += distance.y
@@ -167,7 +254,7 @@ final class ZoomCanvas: NSView {
         controlPressed: Bool,
         at mouse: NSPoint
     ) {
-        guard controlPressed else {
+        guard controlPressed || annotationMode else {
             imageOrigin.x += deltaX
             imageOrigin.y += deltaY
             clampImageOrigin()

@@ -13,6 +13,7 @@ struct HoldZoomSettings: Codable {
     var zoom: Zoom
     var flashlight: Flashlight
     var keyboardPan: KeyboardPan
+    var annotationAppearance: AnnotationAppearance
 
     static let `default` = HoldZoomSettings(
         shortcuts: Shortcuts(
@@ -25,7 +26,14 @@ struct HoldZoomSettings: Codable {
             panLeft: ["a", "left"],
             panDown: ["s", "down"],
             panRight: ["d", "right"],
-            panModifiers: []
+            panModifiers: [],
+            annotations: AnnotationShortcuts(
+                enter: KeyBinding(key: "n", modifiers: []),
+                undo: KeyBinding(key: "z", modifiers: [.command]),
+                redo: KeyBinding(key: "z", modifiers: [.command, .shift]),
+                clear: KeyBinding(key: "delete", modifiers: [.option]),
+                save: KeyBinding(key: "s", modifiers: [.option])
+            )
         ),
         zoom: Zoom(
             minimum: 1,
@@ -43,10 +51,17 @@ struct HoldZoomSettings: Codable {
             accelerationResponse: 24,
             decelerationResponse: 10,
             stopSpeed: 5
+        ),
+        annotationAppearance: AnnotationAppearance(
+            color: .red,
+            lineWidth: 3,
+            fillShapes: false,
+            eraserMode: .partial,
+            eraserSize: 32
         )
     )
 
-    struct Shortcuts: Codable {
+    struct Shortcuts: Encodable {
         var flashlight: KeyBinding
         var zoom: ModifierKey
         var captureWhileHeld: ModifierKey
@@ -57,6 +72,7 @@ struct HoldZoomSettings: Codable {
         var panDown: [String]
         var panRight: [String]
         var panModifiers: [ModifierKey]
+        var annotations: AnnotationShortcuts
 
         func panDirection(for event: NSEvent) -> NSPoint? {
             let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
@@ -95,11 +111,16 @@ struct HoldZoomSettings: Codable {
         var key: String
         var modifiers: [ModifierKey]
 
-        func matches(_ event: NSEvent) -> Bool {
+        func matches(
+            _ event: NSEvent,
+            ignoring ignoredModifiers: Set<ModifierKey> = []
+        ) -> Bool {
             guard Self.keyCode(for: key) == event.keyCode else { return false }
             let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-            let actualModifiers = ModifierKey.allCases.filter { flags.contains($0.eventFlag) }
-            return Set(actualModifiers) == Set(modifiers)
+            let actualModifiers = Set(
+                ModifierKey.allCases.filter { flags.contains($0.eventFlag) }
+            ).subtracting(ignoredModifiers)
+            return actualModifiers == Set(modifiers).subtracting(ignoredModifiers)
         }
 
         static func keyCode(for key: String) -> UInt16? {
@@ -186,23 +207,32 @@ struct HoldZoomSettings: Codable {
             && keyboardPan.stopSpeed >= 0
         let validShortcuts = KeyBinding.keyCode(for: shortcuts.flashlight.key) != nil
             && KeyBinding.keyCode(for: shortcuts.exitOverlay.key) != nil
+            && shortcuts.annotations.isValid
             && (shortcuts.captureDelay.map { $0.isFinite && (0 ... 2).contains($0) } ?? true)
             && [shortcuts.panUp, shortcuts.panLeft, shortcuts.panDown, shortcuts.panRight]
             .allSatisfy { !$0.isEmpty && $0.allSatisfy { KeyBinding.keyCode(for: $0) != nil } }
 
         return validZoom && validFlashlight && validPan && validShortcuts
+            && annotationAppearance.isValid
     }
 
     static func load() -> HoldZoomSettings {
-        let configURL = FileManager.default.homeDirectoryForCurrentUser
-            .appending(path: ".config/holdzoom.json")
+        let configURL = configurationURL
 
         do {
             let data = try Data(contentsOf: configURL)
-            let settings = try JSONDecoder().decode(HoldZoomSettings.self, from: data)
+            var settings = try JSONDecoder().decode(HoldZoomSettings.self, from: data)
             guard settings.isValid else {
                 NSLog("HoldZoom settings contain invalid values; using defaults")
                 return .default
+            }
+            if needsAnnotationShortcutMigration(data) {
+                settings.shortcuts.annotations.enter.modifiers = []
+                do {
+                    try save(settings, to: configURL)
+                } catch {
+                    NSLog("HoldZoom could not update settings: %@", error.localizedDescription)
+                }
             }
             return settings
         } catch {
@@ -216,14 +246,143 @@ struct HoldZoomSettings: Codable {
                     at: configURL.deletingLastPathComponent(),
                     withIntermediateDirectories: true
                 )
-                let encoder = JSONEncoder()
-                encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-                let data = try encoder.encode(HoldZoomSettings.default)
-                try data.write(to: configURL, options: .atomic)
+                try save(.default, to: configURL)
             } catch {
                 NSLog("HoldZoom could not create settings: %@", error.localizedDescription)
             }
             return .default
         }
+    }
+
+    private static func needsAnnotationShortcutMigration(_ data: Data) -> Bool {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let shortcuts = root["shortcuts"] as? [String: Any]
+        else { return false }
+        guard let annotations = shortcuts["annotations"] as? [String: Any] else { return true }
+        guard let enter = annotations["enter"] as? [String: Any],
+              let modifiers = enter["modifiers"] as? [Any]
+        else { return true }
+        return !modifiers.isEmpty
+    }
+
+    private static func save(_ settings: HoldZoomSettings, to url: URL) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(settings)
+        try data.write(to: url, options: .atomic)
+    }
+
+    static func save(annotationAppearance: AnnotationAppearance) throws {
+        var settings = load()
+        settings.annotationAppearance = annotationAppearance
+        try save(settings, to: configurationURL)
+    }
+
+    private static var configurationURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appending(path: ".config/holdzoom.json")
+    }
+}
+
+struct AnnotationShortcuts: Codable {
+    var enter: HoldZoomSettings.KeyBinding
+    var undo: HoldZoomSettings.KeyBinding
+    var redo: HoldZoomSettings.KeyBinding
+    var clear: HoldZoomSettings.KeyBinding
+    var save: HoldZoomSettings.KeyBinding
+
+    var all: [HoldZoomSettings.KeyBinding] {
+        [enter, undo, redo, clear, save]
+    }
+
+    var isValid: Bool {
+        let validKeys = all.allSatisfy { HoldZoomSettings.KeyBinding.keyCode(for: $0.key) != nil }
+        let identifiers = all.map { binding in
+            "\(binding.key.lowercased())|\(binding.modifiers.map(\.rawValue).sorted().joined(separator: ","))"
+        }
+        return validKeys && Set(identifiers).count == identifiers.count
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case enter
+        case toggle
+        case undo
+        case redo
+        case clear
+        case save
+    }
+
+    init(
+        enter: HoldZoomSettings.KeyBinding,
+        undo: HoldZoomSettings.KeyBinding,
+        redo: HoldZoomSettings.KeyBinding,
+        clear: HoldZoomSettings.KeyBinding,
+        save: HoldZoomSettings.KeyBinding
+    ) {
+        self.enter = enter
+        self.undo = undo
+        self.redo = redo
+        self.clear = clear
+        self.save = save
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        enter = try container.decodeIfPresent(HoldZoomSettings.KeyBinding.self, forKey: .enter)
+            ?? container.decode(HoldZoomSettings.KeyBinding.self, forKey: .toggle)
+        undo = try container.decode(HoldZoomSettings.KeyBinding.self, forKey: .undo)
+        redo = try container.decodeIfPresent(HoldZoomSettings.KeyBinding.self, forKey: .redo)
+            ?? HoldZoomSettings.default.shortcuts.annotations.redo
+        clear = try container.decode(HoldZoomSettings.KeyBinding.self, forKey: .clear)
+        save = try container.decode(HoldZoomSettings.KeyBinding.self, forKey: .save)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(enter, forKey: .enter)
+        try container.encode(undo, forKey: .undo)
+        try container.encode(redo, forKey: .redo)
+        try container.encode(clear, forKey: .clear)
+        try container.encode(save, forKey: .save)
+    }
+}
+
+private enum ShortcutsCodingKeys: String, CodingKey {
+    case flashlight
+    case zoom
+    case captureWhileHeld
+    case captureDelay
+    case exitOverlay
+    case panUp
+    case panLeft
+    case panDown
+    case panRight
+    case panModifiers
+    case annotations
+}
+
+extension HoldZoomSettings.Shortcuts: Decodable {
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: ShortcutsCodingKeys.self)
+        flashlight = try container.decode(HoldZoomSettings.KeyBinding.self, forKey: .flashlight)
+        zoom = try container.decode(HoldZoomSettings.ModifierKey.self, forKey: .zoom)
+        captureWhileHeld = try container.decode(
+            HoldZoomSettings.ModifierKey.self,
+            forKey: .captureWhileHeld
+        )
+        captureDelay = try container.decodeIfPresent(TimeInterval.self, forKey: .captureDelay)
+        exitOverlay = try container.decode(HoldZoomSettings.KeyBinding.self, forKey: .exitOverlay)
+        panUp = try container.decode([String].self, forKey: .panUp)
+        panLeft = try container.decode([String].self, forKey: .panLeft)
+        panDown = try container.decode([String].self, forKey: .panDown)
+        panRight = try container.decode([String].self, forKey: .panRight)
+        panModifiers = try container.decode(
+            [HoldZoomSettings.ModifierKey].self,
+            forKey: .panModifiers
+        )
+        annotations = try container.decodeIfPresent(
+            AnnotationShortcuts.self,
+            forKey: .annotations
+        ) ?? HoldZoomSettings.default.shortcuts.annotations
     }
 }
